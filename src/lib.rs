@@ -34,12 +34,14 @@ static EXT_ALIASES: &[u8] = b"kki\0";
 
 static LEXICAL_PROFILE: &[u8] = b"{\
   \"version\": 1,\
+  \"language\": \"koka\",\
   \"extensions\": [\"kk\", \"kki\"],\
   \"line_comments\": [\"//\"],\
-  \"block_comment\": {\"open\": \"/*\", \"close\": \"*/\", \"nested\": true},\
+  \"block_comment\": [\"/*\", \"*/\"],\
+  \"nested_block_comments\": true,\
   \"strings\": [\
     {\"open\": \"\\\"\", \"close\": \"\\\"\"},\
-    {\"open\": \"@\\\"\", \"close\": \"\\\"\"}\
+    {\"open\": \"@\\\"\", \"close\": \"\\\"\", \"escape\": null}\
   ]\
 }\0";
 
@@ -451,16 +453,65 @@ pub fn parse_spans(src: &[u8], max_spans: usize) -> Vec<(u32, u32, u8)> {
 
 // ── Retrieval chunks ────────────────────────────────────────────────────────
 
+fn line_start(src: &[u8], offset: usize) -> usize {
+    let mut i = offset.min(src.len());
+    while i > 0 && src[i - 1] != b'\n' {
+        i -= 1;
+    }
+    i
+}
+
+fn line_indent(src: &[u8], offset: usize) -> usize {
+    let ls = line_start(src, offset);
+    let mut indent = 0usize;
+    let mut i = ls;
+    while i < src.len() {
+        match src[i] {
+            b' ' => indent += 1,
+            b'\t' => indent += 2,
+            _ => break,
+        }
+        i += 1;
+    }
+    indent
+}
+
+fn is_top_level_decl(src: &[u8], tokens: &[Token], kw_idx: usize) -> bool {
+    let ls = line_start(src, tokens[kw_idx].start);
+    line_indent(src, ls) == 0
+}
+
 fn find_decl_end(src: &[u8], tokens: &[Token], start_tok: usize) -> usize {
     let mut brace_depth = 0usize;
     let mut saw_brace = false;
-    let start_line_end = src[tokens[start_tok].start..]
+    let decl_start = tokens[start_tok].start;
+    let decl_line_start = line_start(src, decl_start);
+    let decl_indent = line_indent(src, decl_start);
+    let start_line_end = src[decl_start..]
         .iter()
         .position(|&b| b == b'\n')
-        .map(|p| tokens[start_tok].start + p)
+        .map(|p| decl_start + p)
         .unwrap_or(src.len());
 
+    let mut last_body_end = start_line_end;
+    let mut saw_indented_body = false;
+
     for tok in &tokens[start_tok..] {
+        if !saw_brace && tok.kind != TokKind::Comment {
+            let tok_ls = line_start(src, tok.start);
+            if tok_ls > decl_line_start {
+                let indent = line_indent(src, tok.start);
+                if indent <= decl_indent {
+                    return if saw_indented_body {
+                        last_body_end
+                    } else {
+                        start_line_end
+                    };
+                }
+                saw_indented_body = true;
+                last_body_end = tok.end;
+            }
+        }
         match tok.kind {
             TokKind::LBrace => {
                 saw_brace = true;
@@ -477,7 +528,11 @@ fn find_decl_end(src: &[u8], tokens: &[Token], start_tok: usize) -> usize {
             _ => {}
         }
     }
-    start_line_end
+    if saw_indented_body {
+        last_body_end
+    } else {
+        start_line_end
+    }
 }
 
 pub fn retrieval_chunks(src: &[u8], max_chunks: usize) -> Vec<(u32, u32, String, u8)> {
@@ -573,7 +628,7 @@ pub fn retrieval_chunks(src: &[u8], max_chunks: usize) -> Vec<(u32, u32, String,
                     }
                 }
             }
-            "val" | "var" if brace_depth == 0 => {
+            "val" | "var" if brace_depth == 0 && is_top_level_decl(src, &tokens, i) => {
                 if let Some(name_tok) = tokens.get(i + 1) {
                     if matches!(name_tok.kind, TokKind::Ident | TokKind::UpperIdent) {
                         let name = tok_str(src, *name_tok);
@@ -695,5 +750,47 @@ pub fun greet(name : string) : console () {
         let chunks = retrieval_chunks(src, 16);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].2, "function ok");
+    }
+
+    #[test]
+    fn indentation_scoped_local_val_is_not_top_level_property() {
+        let src = br#"
+pub val top-const : int = 42
+
+pub fun outer(x : int) : total int
+  val local-tmp = x + 1
+  fun helper(y : int) : total int
+    y * 2
+  helper(local-tmp)
+
+pub fun next-fn() : total int
+  0
+"#;
+        let chunks = retrieval_chunks(src, 32);
+        let labels: Vec<&str> = chunks.iter().map(|c| c.2.as_str()).collect();
+        assert!(labels.contains(&"property top-const"), "got {labels:?}");
+        assert!(
+            !labels.contains(&"property local-tmp"),
+            "local val leaked as top-level property: {labels:?}"
+        );
+        assert!(labels.contains(&"function outer"), "got {labels:?}");
+        assert!(labels.contains(&"function helper"), "got {labels:?}");
+        assert!(labels.contains(&"function next-fn"), "got {labels:?}");
+
+        let outer = chunks.iter().find(|c| c.2 == "function outer").unwrap();
+        let helper = chunks.iter().find(|c| c.2 == "function helper").unwrap();
+        let next_fn = chunks.iter().find(|c| c.2 == "function next-fn").unwrap();
+        assert!(
+            helper.0 >= outer.0 && helper.0 + helper.1 <= outer.0 + outer.1,
+            "helper ({:?}) must nest inside outer ({:?})",
+            helper,
+            outer
+        );
+        assert!(
+            outer.0 + outer.1 <= next_fn.0,
+            "outer ({:?}) must end before next-fn ({:?})",
+            outer,
+            next_fn
+        );
     }
 }
